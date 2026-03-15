@@ -12,10 +12,10 @@ import ssl
 from collections import deque
 
 CAM_W, CAM_H = 640, 480
-SIM_W, SIM_H = 1280, 720
+SIM_W, SIM_H = 1920, 1080
 TOTAL_W, TOTAL_H = SIM_W, SIM_H
 
-ROBOT_SPEED = 0.4
+ROBOT_SPEED = 0.15
 WORLD_RADIUS = 8.0
 GESTURE_STABLE_FRAMES = 3
 
@@ -34,29 +34,12 @@ if not os.path.exists(MODEL_PATH):
 base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
-    num_hands=1,
+    num_hands=2,
     min_hand_detection_confidence=0.4,
     min_tracking_confidence=0.4,
     min_hand_presence_confidence=0.4
 )
 hand_landmarker = vision.HandLandmarker.create_from_options(options)
-
-POSE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker.task")
-POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
-
-if not os.path.exists(POSE_MODEL_PATH):
-    print("Downloading pose landmarker model...")
-    urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
-    print("Pose model downloaded!")
-
-pose_base_options = python.BaseOptions(model_asset_path=POSE_MODEL_PATH)
-pose_options = vision.PoseLandmarkerOptions(
-    base_options=pose_base_options,
-    output_segmentation_masks=False,
-    min_pose_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-pose_landmarker = vision.PoseLandmarker.create_from_options(pose_options)
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -76,6 +59,13 @@ robot_state = "IDLE"
 current_gesture = "NONE"
 stable_gesture = "NONE"
 gesture_history = deque(maxlen=GESTURE_STABLE_FRAMES)
+
+# --- Action hand (second hand) state ---
+action_gesture = "NONE"
+stable_action_gesture = "NONE"
+action_gesture_history = deque(maxlen=GESTURE_STABLE_FRAMES)
+robot_frozen = False
+prev_action_fist = False
 
 # ------------------ PICK/DROP STATE ------------------
 held_object = None
@@ -120,9 +110,9 @@ obj_colors = [
     (0, 255, 255), (50, 200, 255), (255, 200, 0), (100, 255, 100),
     (180, 50, 255), (255, 150, 50),
 ]
-for _ in range(18):
-    wx = random.uniform(-WORLD_RADIUS * 0.8, WORLD_RADIUS * 0.8)
-    wz = random.uniform(-WORLD_RADIUS * 0.8, WORLD_RADIUS * 0.8)
+for _ in range(50):
+    wx = random.uniform(-WORLD_RADIUS * 0.95, WORLD_RADIUS * 0.95)
+    wz = random.uniform(-WORLD_RADIUS * 0.95, WORLD_RADIUS * 0.95)
     static_objects.append({
         "x": wx, "z": wz,
         "color": random.choice(obj_colors),
@@ -132,9 +122,9 @@ for _ in range(18):
 
 # Wandering stick figure humans
 wandering_humans = []
-for _ in range(6):
-    wx = random.uniform(-WORLD_RADIUS * 0.6, WORLD_RADIUS * 0.6)
-    wz = random.uniform(-WORLD_RADIUS * 0.6, WORLD_RADIUS * 0.6)
+for _ in range(12):
+    wx = random.uniform(-WORLD_RADIUS * 0.9, WORLD_RADIUS * 0.9)
+    wz = random.uniform(-WORLD_RADIUS * 0.9, WORLD_RADIUS * 0.9)
     wandering_humans.append({
         "x": wx, "z": wz,
         "vx": random.uniform(-0.02, 0.02),
@@ -152,8 +142,11 @@ def fingers_up(landmarks):
         out.append(landmarks[tip].y < landmarks[pip].y)
     return out
 
-def thumb_up(landmarks):
-    return landmarks[4].x < landmarks[3].x
+def thumb_up(landmarks, handedness="Right"):
+    if handedness == "Right":
+        return landmarks[4].x < landmarks[3].x
+    else:
+        return landmarks[4].x > landmarks[3].x
 
 def get_pinch_distance(landmarks_list):
     if not landmarks_list:
@@ -163,9 +156,9 @@ def get_pinch_distance(landmarks_list):
     dy = lm[8].y - lm[4].y
     return math.hypot(dx, dy)
 
-def classify_gesture(landmarks):
+def classify_gesture(landmarks, handedness="Right"):
     index, middle, ring, pinky = fingers_up(landmarks)
-    thumb = thumb_up(landmarks)
+    thumb = thumb_up(landmarks, handedness)
     up_count = sum([index, middle, ring, pinky])
 
     if up_count == 0:
@@ -190,8 +183,21 @@ def update_stable_gesture(new_gesture):
         if len(unique) == 1:
             stable_gesture = list(unique)[0]
 
+def update_stable_action_gesture(new_gesture):
+    global stable_action_gesture
+    action_gesture_history.append(new_gesture)
+    if len(action_gesture_history) == GESTURE_STABLE_FRAMES:
+        unique = set(action_gesture_history)
+        if len(unique) == 1:
+            stable_action_gesture = list(unique)[0]
+
 def update_robot():
     global robot_x, robot_z, robot_state, robot_angle, target_angle
+
+    # Freeze overrides everything — action hand open palm
+    if robot_frozen:
+        robot_state = "FROZEN"
+        return
 
     # No wheels/treads/legs = no movement
     wheels = toolbox_parts["Wheels (WASD)"][selected_parts["Wheels (WASD)"]]
@@ -535,15 +541,15 @@ def update_toolbox_logic(cx, cy, pinching):
     """Handle hover-to-toggle and pinch-to-cycle logic for toolbox (no drawing)."""
     global selected_parts, last_click_time, last_hovered_cat
 
-    box_w = 220
-    box_h = 50
+    box_sz = 100
     padding = 15
-    start_x = 20
+    total_w = len(toolbox_categories) * box_sz + (len(toolbox_categories) - 1) * padding
+    start_x = (SIM_W - total_w) // 2
     start_y = 65
 
     cursor_in_ui = False
 
-    if start_x <= cx <= start_x + len(toolbox_categories) * (box_w + padding) and start_y <= cy <= start_y + box_h:
+    if start_x <= cx <= start_x + total_w and start_y <= cy <= start_y + box_sz:
         cursor_in_ui = True
 
     chassis_equipped = toolbox_parts["Chassis"][selected_parts["Chassis"]] != "None"
@@ -557,10 +563,10 @@ def update_toolbox_logic(cx, cy, pinching):
     now = time.time()
     current_hover = None
     for i, cat in enumerate(toolbox_categories):
-        bx = start_x + i * (box_w + padding)
+        bx = start_x + i * (box_sz + padding)
         by = start_y
 
-        is_hover = (bx <= cx <= bx + box_w) and (by <= cy <= by + box_h)
+        is_hover = (bx <= cx <= bx + box_sz) and (by <= cy <= by + box_sz)
 
         if is_hover:
             current_hover = cat
@@ -587,23 +593,50 @@ def update_toolbox_logic(cx, cy, pinching):
     return cursor_in_ui
 
 
+def draw_rounded_rect(img, pt1, pt2, color, thickness, radius):
+    """Draw a rectangle with rounded corners."""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    r = min(radius, (x2 - x1) // 2, (y2 - y1) // 2)
+    if thickness == -1:
+        # Filled
+        cv2.rectangle(img, (x1 + r, y1), (x2 - r, y2), color, -1)
+        cv2.rectangle(img, (x1, y1 + r), (x2, y2 - r), color, -1)
+        cv2.circle(img, (x1 + r, y1 + r), r, color, -1)
+        cv2.circle(img, (x2 - r, y1 + r), r, color, -1)
+        cv2.circle(img, (x1 + r, y2 - r), r, color, -1)
+        cv2.circle(img, (x2 - r, y2 - r), r, color, -1)
+    else:
+        # Border only
+        cv2.line(img, (x1 + r, y1), (x2 - r, y1), color, thickness)
+        cv2.line(img, (x1 + r, y2), (x2 - r, y2), color, thickness)
+        cv2.line(img, (x1, y1 + r), (x1, y2 - r), color, thickness)
+        cv2.line(img, (x2, y1 + r), (x2, y2 - r), color, thickness)
+        cv2.ellipse(img, (x1 + r, y1 + r), (r, r), 180, 0, 90, color, thickness)
+        cv2.ellipse(img, (x2 - r, y1 + r), (r, r), 270, 0, 90, color, thickness)
+        cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 90, 0, 90, color, thickness)
+        cv2.ellipse(img, (x2 - r, y2 - r), (r, r), 0, 0, 90, color, thickness)
+
+
 def draw_toolbox(sim, cursor_x, cursor_y):
     """Draw the toolbox UI overlay on top of the simulation."""
-    cv2.putText(sim, "Toolbox", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-    box_w = 220
-    box_h = 50
+    box_sz = 100
     padding = 15
-    start_x = 20
+    total_w = len(toolbox_categories) * box_sz + (len(toolbox_categories) - 1) * padding
+    start_x = (SIM_W - total_w) // 2
     start_y = 65
+    corner_r = 12
+
+    title_sz = cv2.getTextSize("Toolbox", cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+    cv2.putText(sim, "Toolbox", ((SIM_W - title_sz[0]) // 2, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
     chassis_equipped = toolbox_parts["Chassis"][selected_parts["Chassis"]] != "None"
 
     for i, cat in enumerate(toolbox_categories):
-        bx = start_x + i * (box_w + padding)
+        bx = start_x + i * (box_sz + padding)
         by = start_y
 
-        is_hover = (bx <= cursor_x <= bx + box_w) and (by <= cursor_y <= by + box_h)
+        is_hover = (bx <= cursor_x <= bx + box_sz) and (by <= cursor_y <= by + box_sz)
         locked = cat != "Chassis" and not chassis_equipped
 
         if locked:
@@ -611,18 +644,28 @@ def draw_toolbox(sim, cursor_x, cursor_y):
         else:
             color = toolbox_colors[i]
 
-        cv2.rectangle(sim, (bx, by), (bx + box_w, by + box_h), color, -1)
+        draw_rounded_rect(sim, (bx, by), (bx + box_sz, by + box_sz), color, -1, corner_r)
         if is_hover and not locked:
-            cv2.rectangle(sim, (bx-2, by-2), (bx + box_w + 2, by + box_h + 2), (255, 255, 255), 2)
+            draw_rounded_rect(sim, (bx - 2, by - 2), (bx + box_sz + 2, by + box_sz + 2), (255, 255, 255), 2, corner_r)
 
         active_part = toolbox_parts[cat][selected_parts[cat]]
+        short_name = cat.split(" (")[0]
         if locked:
-            text = f"{cat}: --"
+            label = "--"
             text_color = (80, 80, 80)
         else:
-            text = f"{cat}: {active_part}"
+            is_on = active_part not in ("None", "Off")
+            label = "On" if is_on else "Off"
             text_color = (255, 255, 255)
-        cv2.putText(sim, text, (bx + 15, by + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 2)
+
+        # Name centered
+        name_sz = cv2.getTextSize(short_name, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+        cv2.putText(sim, short_name, (bx + (box_sz - name_sz[0]) // 2, by + 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, text_color, 1)
+        # On/Off centered below
+        label_sz = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+        cv2.putText(sim, label, (bx + (box_sz - label_sz[0]) // 2, by + 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
 
 def draw_landmarks_on_image(image, hand_landmarks_list, image_width, image_height):
     t = time.time()
@@ -916,8 +959,8 @@ def render_robot_camera_view(view_w, view_h):
 def draw_status_panel(sim):
     """Draw a small info box at the bottom-left showing equipped parts and lidar detections."""
     h, w, _ = sim.shape
-    panel_w = 420
-    panel_h = 130
+    panel_w = 600
+    panel_h = 200
     px, py = 10, h - panel_h - 10
 
     # Semi-transparent background
@@ -927,8 +970,8 @@ def draw_status_panel(sim):
     cv2.rectangle(sim, (px, py), (px + panel_w, py + panel_h), (100, 100, 100), 1)
 
     # --- Left side: Equipped Parts ---
-    cv2.putText(sim, "EQUIPPED", (px + 8, py + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-    cv2.line(sim, (px + 8, py + 22), (px + 90, py + 22), (80, 80, 80), 1)
+    cv2.putText(sim, "EQUIPPED", (px + 10, py + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+    cv2.line(sim, (px + 10, py + 30), (px + 120, py + 30), (80, 80, 80), 1)
 
     row = 0
     part_labels = [
@@ -942,48 +985,47 @@ def draw_status_panel(sim):
         val = toolbox_parts[cat][selected_parts[cat]]
         if val in ("None", "Off"):
             continue
-        short_cat = cat.split(" (")[0]  # "Wheels (WASD)" -> "Wheels"
+        short_cat = cat.split(" (")[0]
         txt = f"{short_cat}: {val}"
-        ty = py + 36 + row * 16
-        cv2.circle(sim, (px + 14, ty - 4), 4, color, -1)
-        cv2.putText(sim, txt, (px + 24, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1)
+        ty = py + 50 + row * 22
+        cv2.circle(sim, (px + 16, ty - 5), 5, color, -1)
+        cv2.putText(sim, txt, (px + 28, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1)
         row += 1
 
     if row == 0:
-        cv2.putText(sim, "No parts equipped", (px + 14, py + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
+        cv2.putText(sim, "No parts equipped", (px + 16, py + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
 
     if held_object is not None:
-        ty = py + 36 + row * 16
-        cv2.circle(sim, (px + 14, ty - 4), 4, held_object["color"], -1)
-        cv2.putText(sim, f"Holding: {held_object['shape'].capitalize()}", (px + 24, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 200, 0), 1)
+        ty = py + 50 + row * 22
+        cv2.circle(sim, (px + 16, ty - 5), 5, held_object["color"], -1)
+        cv2.putText(sim, f"Holding: {held_object['shape'].capitalize()}", (px + 28, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
 
     # --- Right side: Lidar Detections ---
-    lidar_x = px + 200
-    cv2.line(sim, (lidar_x - 5, py + 6), (lidar_x - 5, py + panel_h - 6), (60, 60, 60), 1)
-    cv2.putText(sim, "LIDAR SCAN", (lidar_x + 4, py + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 240), 1)
-    cv2.line(sim, (lidar_x + 4, py + 22), (lidar_x + 100, py + 22), (80, 80, 80), 1)
+    lidar_x = px + 280
+    cv2.line(sim, (lidar_x - 5, py + 8), (lidar_x - 5, py + panel_h - 8), (60, 60, 60), 1)
+    cv2.putText(sim, "LIDAR SCAN", (lidar_x + 6, py + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 240), 1)
+    cv2.line(sim, (lidar_x + 6, py + 30), (lidar_x + 140, py + 30), (80, 80, 80), 1)
 
     lidar = toolbox_parts["Lidar"][selected_parts["Lidar"]]
     if lidar != "On":
-        cv2.putText(sim, "OFFLINE", (lidar_x + 14, py + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)
+        cv2.putText(sim, "OFFLINE", (lidar_x + 16, py + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
     else:
         detections = get_lidar_detections()
         if not detections:
-            cv2.putText(sim, "No contacts", (lidar_x + 14, py + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 200, 80), 1)
+            cv2.putText(sim, "No contacts", (lidar_x + 16, py + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 200, 80), 1)
         else:
-            for i, det in enumerate(detections[:6]):
-                dy = py + 36 + i * 15
+            for i, det in enumerate(detections[:8]):
+                dy = py + 50 + i * 20
                 dist_str = f"{det['dist']:.1f}m"
                 label = f"{det['type']} - {dist_str}"
-                # Color code by distance
                 if det["dist"] < 1.5:
-                    col = (50, 50, 255)   # red = close
+                    col = (50, 50, 255)
                 elif det["dist"] < 3.0:
-                    col = (50, 200, 255)  # yellow = mid
+                    col = (50, 200, 255)
                 else:
-                    col = (80, 200, 80)   # green = far
-                cv2.circle(sim, (lidar_x + 10, dy - 3), 3, col, -1)
-                cv2.putText(sim, label, (lidar_x + 20, dy), cv2.FONT_HERSHEY_SIMPLEX, 0.33, col, 1)
+                    col = (80, 200, 80)
+                cv2.circle(sim, (lidar_x + 12, dy - 4), 4, col, -1)
+                cv2.putText(sim, label, (lidar_x + 24, dy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1)
 
 
 def draw_sim(sim):
@@ -995,7 +1037,7 @@ def draw_sim(sim):
     span_x = w * 0.4
 
     # Draw perspective grid
-    num_lines = 20
+    num_lines = 60
     for i in range(-num_lines, num_lines + 1):
         x_bottom = cx + i * 30
         x_top = cx + int(i * 10)
@@ -1004,8 +1046,7 @@ def draw_sim(sim):
     for j in range(1, 10):
         tj = j / 10.0
         y = int(horizon_y + tj * (ground_y - horizon_y))
-        x_span = int((1 - tj) * (w * 0.45))
-        cv2.line(sim, (cx - x_span, y), (cx + x_span, y), (25, 45, 45), 1)
+        cv2.line(sim, (0, y), (w, y), (25, 45, 45), 1)
 
     # --- Draw static objects ---
     for i, obj in enumerate(static_objects):
@@ -1065,6 +1106,8 @@ def draw_sim(sim):
             light_color = (0, int(255 * light_pulse), int(255 * light_pulse))
         elif robot_state == "TURNING":
             light_color = (0, int(200 * light_pulse), int(255 * light_pulse))
+        elif robot_state == "FROZEN":
+            light_color = (int(255 * light_pulse), 0, int(128 * light_pulse))
         else:
             light_color = (0, int(255 * light_pulse), 0)
         cv2.circle(sim, (light_x, sy - 14), 2, light_color, -1)
@@ -1132,7 +1175,7 @@ def draw_hud_frame(frame, current_gesture, stable_gesture):
 # ------------------ MAIN LOOP ------------------
 
 def main():
-    global current_gesture
+    global current_gesture, action_gesture, robot_frozen, prev_action_fist
 
     print("\n" + "=" * 60)
     print("  J.A.R.V.I.S. GESTURE ROBOT ASSEMBLER + TOOLBOX")
@@ -1155,8 +1198,8 @@ def main():
         return
 
     window_name = "3D Gesture Robot Assembler"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, TOTAL_W, TOTAL_H)
+    cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     
     while True:
         ret, frame = cap.read()
@@ -1172,6 +1215,7 @@ def main():
         results = hand_landmarker.detect(mp_image)
 
         current_gesture = "NONE"
+        action_gesture = "NONE"
         pinching = False
         cursor_x, cursor_y = -100, -100
 
@@ -1179,18 +1223,53 @@ def main():
         sim = np.zeros((SIM_H, SIM_W, 3), dtype=np.uint8)
 
         if results.hand_landmarks:
-            hand_landmarks = results.hand_landmarks[0]
-            
-            # Map index finger (8) to simulator coordinates
-            cursor_x = int(hand_landmarks[8].x * SIM_W)
-            cursor_y = int(hand_landmarks[8].y * SIM_H)
-            
-            dist = get_pinch_distance(results.hand_landmarks)
-            pinching = dist < 0.05
-            
-            current_gesture = classify_gesture(hand_landmarks)
-            
+            movement_lm = None
+            action_lm = None
+            mv_handedness = "Right"
+
+            # Assign hands by handedness
+            for i, hand_lm in enumerate(results.hand_landmarks):
+                label = results.handedness[i][0].category_name
+                if label == "Right":
+                    movement_lm = hand_lm
+                    mv_handedness = "Right"
+                elif label == "Left":
+                    action_lm = hand_lm
+
+            # Single-hand fallback: if only one hand, use it for movement
+            if movement_lm is None and action_lm is not None:
+                movement_lm = action_lm
+                mv_handedness = "Left"
+                action_lm = None
+
+            # Process movement hand
+            if movement_lm is not None:
+                cursor_x = int(movement_lm[8].x * SIM_W)
+                cursor_y = int(movement_lm[8].y * SIM_H)
+                dx = movement_lm[8].x - movement_lm[4].x
+                dy = movement_lm[8].y - movement_lm[4].y
+                pinching = math.hypot(dx, dy) < 0.05
+                current_gesture = classify_gesture(movement_lm, mv_handedness)
+
+            # Process action hand
+            if action_lm is not None:
+                action_gesture = classify_gesture(action_lm, "Left")
+
+        # Stabilize both gesture streams
         update_stable_gesture(current_gesture)
+        update_stable_action_gesture(action_gesture)
+
+        # Derive freeze from action hand open palm
+        robot_frozen = (stable_action_gesture == "HOVER")
+
+        # Derive pick/drop from action hand fist (edge-triggered)
+        current_action_fist = (stable_action_gesture == "LAND")
+        if current_action_fist and not prev_action_fist:
+            if held_object is None:
+                try_pickup()
+            else:
+                try_drop()
+        prev_action_fist = current_action_fist
 
         # 1. Update toolbox selection logic (hover-to-add + pinch-to-cycle)
         cursor_in_ui = update_toolbox_logic(cursor_x, cursor_y, pinching)
@@ -1207,6 +1286,11 @@ def main():
         # 2. Draw the background and robot simulation onto `sim`
         draw_sim(sim)
 
+        if robot_frozen:
+            text_size = cv2.getTextSize("FROZEN", cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+            tx = (SIM_W - text_size[0]) // 2
+            cv2.putText(sim, "FROZEN", (tx, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 80, 255), 2)
+
         # 3. Draw the toolbox UI overlay on top of the simulation
         draw_toolbox(sim, cursor_x, cursor_y)
 
@@ -1214,7 +1298,7 @@ def main():
         draw_status_panel(sim)
 
         # 5. Draw Picture-in-Picture camera feed in the bottom right corner
-        pip_size = 280
+        pip_size = 380
         # Crop frame to square (center crop) to avoid stretching
         fh, fw = frame.shape[:2]
         crop_dim = min(fw, fh)
@@ -1238,7 +1322,7 @@ def main():
 
         # 6. Robot camera view to the left of user camera (only if camera equipped)
         if toolbox_parts["Camera (View)"][selected_parts["Camera (View)"]] != "None":
-            rv_w, rv_h = 200, 160
+            rv_w, rv_h = 320, 240
             robot_view = render_robot_camera_view(rv_w, rv_h)
             rv_x = pip_x_start - rv_w - 6
             rv_y = pip_y_start + pip_size - rv_h
