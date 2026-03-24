@@ -57,6 +57,7 @@ const MEDIAPIPE_SOURCES = [
     wasmRoot: "https://unpkg.com/@mediapipe/tasks-vision@0.10.21/wasm"
   }
 ];
+const HAND_LANDMARKER_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task";
 
 const canvas = document.getElementById("simCanvas");
 const ctx = canvas.getContext("2d");
@@ -1592,7 +1593,7 @@ async function setupHandTracking() {
   const vision = await visionModule.FilesetResolver.forVisionTasks(activeWasmRoot);
   handLandmarker = await visionModule.HandLandmarker.createFromOptions(vision, {
     baseOptions: {
-      modelAssetPath: new URL("./hand_landmarker.task", window.location.href).href
+      modelAssetPath: HAND_LANDMARKER_MODEL_URL
     },
     runningMode: "VIDEO",
     numHands: 2,
