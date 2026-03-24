@@ -1,0 +1,24 @@
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+body {
+  display: grid;
+  place-items: center;
+}
+
+#simCanvas {
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  background: #000;
+}
+
+#cameraVideo {
+  display: none;
+}
